@@ -6,8 +6,8 @@ namespace ProductImportApi.Models.Csv
     {
         public PriceRawMap()
         {
-            Map(m => m.Sku).Index(1);
-            Map(m => m.NetPrice).Index(2);
+            Map(m => m.SKU).Index(1);
+            Map(m => m.NetPrice).Index(3);
         }
     }
 }

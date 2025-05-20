@@ -2,8 +2,11 @@
 
 public class InventoryRaw
 {
-    public string sku { get; set; }
-    public string unit { get; set; }
-    public string qty { get; set; }
-    public string shipping_cost { get; set; }
+    public string SKU { get; set; }
+    public string Unit { get; set; }
+    public string Qty { get; set; }
+    public string ManufacturerName { get; set; }
+    public string ManufacturerRefNum { get; set; }
+    public string Shipping { get; set; }
+    public string ShippingCost { get; set; }
 }

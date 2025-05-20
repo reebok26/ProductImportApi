@@ -1,12 +1,20 @@
 CREATE TABLE Products (
-    SKU VARCHAR(50) PRIMARY KEY,
+    SKU NVARCHAR(50) PRIMARY KEY,
     Name NVARCHAR(255),
-    EAN VARCHAR(50),
+    EAN NVARCHAR(50),
     Manufacturer NVARCHAR(255),
-    Category NVARCHAR(100),
-    ImageUrl NVARCHAR(500),
-    NetPurchasePrice DECIMAL(18,2),
-    DeliveryCost DECIMAL(18,2),
-    LogisticUnit NVARCHAR(100),
-    Stock INT
+    Category NVARCHAR(max),
+    ImageUrl NVARCHAR(max)
+);
+
+CREATE TABLE Inventory (
+    SKU NVARCHAR(50) PRIMARY KEY,
+    Qty INT,
+    ShippingCost DECIMAL(10,2),
+    Unit NVARCHAR(50)
+);
+
+CREATE TABLE Prices (
+    SKU NVARCHAR(50) PRIMARY KEY,
+    NetPrice DECIMAL(18,2)
 );

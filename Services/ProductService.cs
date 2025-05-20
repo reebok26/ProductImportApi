@@ -1,195 +1,152 @@
-﻿using System.Globalization;
-using CsvHelper;
-using CsvHelper.Configuration;
-using System.Net.Http;
-using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Configuration;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using CsvHelper;
+using CsvHelper.Configuration;
 using Dapper;
-using System;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
+using ProductImportApi.Models;
 using ProductImportApi.Models.Csv;
+using ProductImportApi.Utils;
 
 namespace ProductImportApi.Services
 {
     public class ProductService
     {
-        private readonly IDbConnection _db;
-        private readonly HttpClient _httpClient;
-        private readonly CsvSettings _csvSettings;
+        private readonly string _connectionString;
+        private readonly IDbConnection _dbOverride;
 
-        public ProductService(IConfiguration config, CsvSettings csvSettings)
+        public ProductService(IConfiguration config)
         {
-            _db = new SqlConnection(config.GetConnectionString("Default"));
-            _httpClient = new HttpClient();
-            _csvSettings = csvSettings;
+            _connectionString = config.GetConnectionString("Default");
         }
 
-        public async Task ImportProductsFromCsvAsync()
+        public ProductService(IConfiguration config, IDbConnection dbOverride)
         {
-            var dataDir = Path.Combine(AppContext.BaseDirectory, "Data");
-            Directory.CreateDirectory(dataDir);
+            _connectionString = config.GetConnectionString("Default");
+            _dbOverride = dbOverride;
+        }
 
-            var productsPath = Path.Combine(dataDir, "Products.csv");
-            var inventoryPath = Path.Combine(dataDir, "Inventory.csv");
-            var pricesPath = Path.Combine(dataDir, "Prices.csv");
+        public async Task ImportDataFromCsvAsync()
+        {
+            var products = LoadAndPrepareProducts();
+            Console.WriteLine($"[INFO] Loaded {products.Count()} products.");
 
-            await DownloadFile("https://rekturacjazadanie.blob.core.windows.net/zadanie/Products.csv", productsPath);
-            await DownloadFile("https://rekturacjazadanie.blob.core.windows.net/zadanie/Inventory.csv", inventoryPath);
-            await DownloadFile("https://rekturacjazadanie.blob.core.windows.net/zadanie/Prices.csv", pricesPath);
+            var inventory = LoadAndPrepareInventory();
+            Console.WriteLine($"[INFO] Loaded {inventory.Count()} inventory items.");
 
-            var inventoryMap = CreateUniqueDictionary(ReadCsvFromFile<InventoryRaw>(inventoryPath, ","), i => i.sku, "Inventory");
-            var priceMap = CreateUniqueDictionary(ReadCsvFromFile<PriceRaw>(pricesPath, ","), p => p.Sku, "Prices");
+            var (validPrices, rejectedPrices) = LoadAndPreparePrices();
+            Console.WriteLine($"[INFO] Loaded {validPrices.Count} valid prices, {rejectedPrices.Count} rejected.");
 
-            using var reader = new StreamReader(productsPath);
-            using var csv = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture)
+            CsvImportHelper.LogRejectedPrices(rejectedPrices);
+
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync();
+            using var transaction = connection.BeginTransaction();
+
+            await TruncateTables(connection, transaction);
+            Console.WriteLine("[INFO] Tables truncated.");
+
+            await InsertAllData(connection, transaction, products, inventory, validPrices);
+            Console.WriteLine("[INFO] Data inserted successfully.");
+
+            transaction.Commit();
+            Console.WriteLine("[INFO] Transaction committed.");
+        }
+
+        private IEnumerable<Product> LoadAndPrepareProducts()
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "Data", "Products.csv");
+            var raw = CsvImportHelper.ReadCsv<ProductRaw>(path, ';');
+            var unique = CsvImportHelper.CreateUniqueDictionary(raw, p => p.SKU, "Products");
+
+            return unique.Values.Select(p => new Product
             {
-                HeaderValidated = null,
-                MissingFieldFound = null,
-                Delimiter = ";",
+                SKU = p.SKU,
+                Name = p.Name,
+                EAN = p.EAN,
+                Manufacturer = p.ProducerName,
+                Category = p.Category,
+                ImageUrl = p.DefaultImage
+            });
+        }
+
+        private IEnumerable<Inventory> LoadAndPrepareInventory()
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "Data", "Inventory.csv");
+            var raw = CsvImportHelper.ReadCsv<InventoryRaw>(path, ',');
+            var unique = CsvImportHelper.CreateUniqueDictionary(raw, i => i.SKU, "Inventory");
+
+            return unique.Values.Select(i => new Inventory
+            {
+                SKU = i.SKU,
+                Qty = CsvImportHelper.ParseInt(i.Qty),
+                ShippingCost = CsvImportHelper.ParseDecimal(i.ShippingCost),
+                Unit = i.Unit
+            });
+        }
+
+        private (List<Price> valid, List<Price> rejected) LoadAndPreparePrices()
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "Data", "Prices.csv");
+            var raw = CsvImportHelper.ReadCsv<PriceRaw>(path, ',');
+            var unique = CsvImportHelper.CreateUniqueDictionary(raw, p => p.SKU, "Prices");
+
+            var processed = unique.Values.Select(p => new Price
+            {
+                SKU = p.SKU,
+                NetPrice = CsvImportHelper.ParseDecimal(p.NetPrice)
             });
 
-            await foreach (var raw in csv.GetRecordsAsync<ProductRaw>())
-            {
-                var cleanedShipping = new string(raw.shipping?.Where(char.IsDigit).ToArray());
-                int.TryParse(cleanedShipping, out var ship);
+            var valid = processed.Where(p => p.NetPrice.HasValue && p.NetPrice.Value <= 9999999999999999.99m).ToList();
+            var rejected = processed.Except(valid).ToList();
 
-                if (raw.is_wire != "0" || raw.available != "1" || ship > 24)
-                    continue;
-
-                var product = new Product
-                {
-                    SKU = raw.SKU,
-                    Name = raw.name,
-                    EAN = raw.EAN,
-                    Manufacturer = raw.producer_name,
-                    Category = ExtractLastCategory(raw.category),
-                    ImageUrl = raw.default_image
-                };
-
-                if (inventoryMap.TryGetValue(product.SKU, out var inventory))
-                {
-                    product.Stock = int.TryParse(inventory.qty, out var stock) ? stock : 0;
-                    product.DeliveryCost = decimal.TryParse(inventory.shipping_cost, out var cost) ? cost : 0;
-                    product.LogisticUnit = inventory.unit;
-                }
-
-                if (priceMap.TryGetValue(product.SKU, out var price))
-                {
-                    product.NetPurchasePrice = decimal.TryParse(price.NetPrice, out var net) ? net : 0;
-                }
-
-                var sql = @"MERGE INTO Products AS target
-                    USING (VALUES (@SKU)) AS source(SKU)
-                    ON target.SKU = source.SKU
-                    WHEN MATCHED THEN
-                        UPDATE SET
-                            Name = @Name,
-                            EAN = @EAN,
-                            Manufacturer = @Manufacturer,
-                            Category = @Category,
-                            ImageUrl = @ImageUrl,
-                            NetPurchasePrice = @NetPurchasePrice,
-                            DeliveryCost = @DeliveryCost,
-                            LogisticUnit = @LogisticUnit,
-                            Stock = @Stock
-                    WHEN NOT MATCHED THEN
-                        INSERT (SKU, Name, EAN, Manufacturer, Category, ImageUrl, NetPurchasePrice, DeliveryCost, LogisticUnit, Stock)
-                        VALUES (@SKU, @Name, @EAN, @Manufacturer, @Category, @ImageUrl, @NetPurchasePrice, @DeliveryCost, @LogisticUnit, @Stock);";
-
-                await _db.ExecuteAsync(sql, product);
-            }
+            return (valid, rejected);
         }
 
-        private static string ExtractLastCategory(string? rawCategory)
+        private async Task TruncateTables(SqlConnection connection, SqlTransaction transaction)
         {
-            if (string.IsNullOrWhiteSpace(rawCategory))
-                return string.Empty;
-
-            var separators = new[] { '|', '/' };
-            var parts = rawCategory.Split(separators, StringSplitOptions.RemoveEmptyEntries);
-            return parts.Last().Trim();
+            await connection.ExecuteAsync("TRUNCATE TABLE Products", transaction: transaction);
+            await connection.ExecuteAsync("TRUNCATE TABLE Inventory", transaction: transaction);
+            await connection.ExecuteAsync("TRUNCATE TABLE Prices", transaction: transaction);
         }
 
-        private Dictionary<string, T> CreateUniqueDictionary<T>(IEnumerable<T> records, Func<T, string> keySelector, string sourceName)
+        private async Task InsertAllData(SqlConnection connection, SqlTransaction transaction, IEnumerable<Product> products, IEnumerable<Inventory> inventory, List<Price> prices)
         {
-            var grouped = records.GroupBy(keySelector);
-            var duplicates = grouped.Where(g => g.Count() > 1).ToList();
-
-            if (duplicates.Any())
-            {
-                Console.WriteLine($"[WARN] Duplicate keys found in {sourceName}:");
-                foreach (var dup in duplicates)
-                {
-                    Console.WriteLine($" - {dup.Key}");
-                }
-            }
-
-            return grouped.ToDictionary(g => g.Key, g => g.First());
+            await CsvImportHelper.BulkInsertAsync(connection, transaction, "Products", products);
+            await CsvImportHelper.BulkInsertAsync(connection, transaction, "Inventory", inventory);
+            await CsvImportHelper.BulkInsertAsync(connection, transaction, "Prices", prices);
         }
-
-
-        private async Task DownloadFile(string url, string path)
-        {
-            var data = await _httpClient.GetByteArrayAsync(url);
-            await File.WriteAllBytesAsync(path, data);
-        }
-
-        private IEnumerable<T> ReadCsvFromFile<T>(string path, string? delimiterOverride = null)
-        {
-            var config = new CsvConfiguration(CultureInfo.InvariantCulture)
-            {
-                Delimiter = delimiterOverride ?? _csvSettings.Delimiter,
-                HasHeaderRecord = _csvSettings.HasHeaderRecord,
-                HeaderValidated = null,
-                MissingFieldFound = null,
-                BadDataFound = _csvSettings.IgnoreBadData
-                    ? null
-                    : args => throw new Exception($"Bad CSV data at row {args.Context.Parser.RawRow}: {args.RawRecord}")
-            };
-
-            using var reader = new StreamReader(path);
-            using var csv = new CsvReader(reader, config);
-
-            var mapRegistry = new Dictionary<Type, Action>
-            {
-                [typeof(PriceRaw)] = () => csv.Context.RegisterClassMap<PriceRawMap>(),
-                [typeof(InventoryRaw)] = () => csv.Context.RegisterClassMap<InventoryRawMap>(),
-                [typeof(ProductRaw)] = () => csv.Context.RegisterClassMap<ProductRawMap>()
-            };
-
-            if (mapRegistry.TryGetValue(typeof(T), out var registerMap))
-            {
-                registerMap();
-            }
-
-            return csv.GetRecords<T>().ToList();
-        }
-
-
 
         public async Task<ProductDto> GetProductBySkuAsync(string sku)
         {
-            var sql = "SELECT * FROM Products WHERE SKU = @Sku";
-            var product = await _db.QuerySingleOrDefaultAsync<Product>(sql, new { Sku = sku });
-            if (product == null) return null;
+            if (string.IsNullOrWhiteSpace(sku))
+                return null;
 
-            return new ProductDto
-            {
-                SKU = product.SKU,
-                Name = product.Name,
-                EAN = product.EAN,
-                Manufacturer = product.Manufacturer,
-                Category = product.Category,
-                ImageUrl = product.ImageUrl,
-                Stock = product.Stock,
-                LogisticUnit = product.LogisticUnit,
-                NetPurchasePrice = product.NetPurchasePrice,
-                DeliveryCost = product.DeliveryCost
-            };
+            var sql = @"
+                SELECT 
+                    p.SKU,
+                    p.Name,
+                    p.EAN,
+                    p.Manufacturer,
+                    p.Category,
+                    p.ImageUrl,
+                    i.Qty AS Stock,
+                    i.ShippingCost AS DeliveryCost,
+                    i.Unit AS LogisticUnit,
+                    pr.NetPrice AS NetPurchasePrice
+                FROM Products p
+                LEFT JOIN Inventory i ON p.SKU = i.SKU
+                LEFT JOIN Prices pr ON p.SKU = pr.SKU
+                WHERE p.SKU = @Sku;";
+
+            using var connection = new SqlConnection(_connectionString);
+            return await connection.QuerySingleOrDefaultAsync<ProductDto>(sql, new { Sku = sku });
         }
     }
 }
