@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using CsvHelper;
 using CsvHelper.Configuration;
 using Microsoft.Data.SqlClient;
+using ProductImportApi.Models;
 using ProductImportApi.Models.Csv;
 
 namespace ProductImportApi.Utils
